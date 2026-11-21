@@ -501,3 +501,216 @@ class TestCrossModuleIntegration:
         assert score_result["overall"] > 0
         assert len(store_mod.store.rows("change_capture")) >= 1
         assert len(store_mod.store.rows("govern_score")) >= 1
+
+# ══════════════════════════════════════════════════════════════════
+# 版本结构变更取数：版本履历与变更捕获共用同一份记录
+# ══════════════════════════════════════════════════════════════════
+
+def _structure_reports(asset: str) -> list:
+    return [
+        row for row in store_mod.store.rows("diff_report")
+        if row.get("比较对象") == asset and row.get("比较维度") == "字段结构"
+    ]
+
+
+class TestVersionFieldChangeLedger:
+
+    def _seed_v1(self, s, asset="T10_ASSET", schema="id,gross:decimal(10,2),name"):
+        s["version_history"].create_version(asset, "v1", "初始导入", schema)
+        return asset
+
+    def test_capture_change_keeps_existing_return_shape(self):
+        s = _fresh()
+        result = s["change_capture"].capture_change(
+            "T10_SHAPE", "add", before="", after="phone",
+        )
+        assert set(result) >= {"change", "diff_report", "version_snapshot", "affected_downstream", "pipeline"}
+        assert result["diff_report"]["diff_count"] == 1
+        assert result["version_snapshot"]["created"] is True
+        assert result["change"]["status"] == "已捕获"
+
+    def test_two_entrypoints_share_one_ledger(self):
+        s = _fresh()
+        asset = self._seed_v1(s, "T10_SHARE")
+        s["change_capture"].capture_change(asset, "precision", "decimal(10,2)", "decimal(16,4)")
+        s["version_history"].create_version(asset, "v2", "精度调整", "id,gross:decimal(16,4),name")
+        from_history = s["version_history"].compare_versions(asset, "v1", "v2")
+        from_capture = s["change_capture"].compare_versions(asset, "v1", "v2")
+        assert from_history == from_capture
+        assert from_history[0]["差异字段"] == "gross"
+        assert (from_history[0]["源值"], from_history[0]["目标值"]) == ("decimal(10,2)", "decimal(16,4)")
+
+    def test_comparison_reproducible_after_later_writes(self):
+        s = _fresh()
+        asset = self._seed_v1(s, "T10_REPLAY")
+        s["change_capture"].capture_change(asset, "rename", "gross", "gross_amount")
+        s["version_history"].create_version(asset, "v2", "改名", "id,gross_amount:decimal(10,2),name")
+        first = s["version_history"].compare_versions(asset, "v1", "v2")
+
+        # 冲突的后续写入：再改精度、再建版本
+        s["change_capture"].capture_change(
+            asset, "precision", "decimal(10,2)", "decimal(20,6)", field="gross_amount")
+        s["version_history"].create_version(asset, "v3", "再次调整", "id,gross_amount:decimal(20,6),name")
+
+        assert s["version_history"].compare_versions(asset, "v1", "v2") == first
+        assert s["change_capture"].compare_versions(asset, "v1", "v2") == first
+
+    def test_current_reader_sees_later_effective_changes(self):
+        s = _fresh()
+        asset = self._seed_v1(s, "T10_CURRENT")
+        s["version_history"].create_version(asset, "v2", "改名", "id,gross_amount:decimal(10,2),name")
+        s["change_capture"].capture_change(
+            asset, "precision", "decimal(10,2)", "decimal(18,4)", field="gross_amount")
+
+        current = s["version_history"].get_current_schema(asset)
+        assert {"name": "gross_amount", "type": "decimal(18,4)"} in current
+        latest = s["version_history"].compare_versions(asset, "v2", "current")
+        assert latest[-1]["差异字段"] == "gross_amount"
+        assert latest[-1]["目标值"] == "decimal(18,4)"
+
+    def test_repeat_submission_keeps_single_diff_group(self):
+        s = _fresh()
+        asset = self._seed_v1(s, "T10_REPEAT")
+        s["change_capture"].capture_change(asset, "precision", "decimal(10,2)", "decimal(16,4)")
+        s["version_history"].create_version(asset, "v2", "精度调整", "id,gross:decimal(16,4),name")
+        for _ in range(3):
+            s["version_history"].compare_versions(asset, "v1", "v2")
+        reports = _structure_reports(asset)
+        assert len(reports) == 1
+        assert reports[0]["差异字段"] == "gross"
+
+        # 反向重提仍是同一组，内容跟随比较方向，记录数不增长
+        reversed_reports = s["version_history"].compare_versions(asset, "v2", "v1")
+        assert len(_structure_reports(asset)) == 1
+        assert reversed_reports[0]["源值"] == "decimal(16,4)"
+        assert reversed_reports[0]["目标值"] == "decimal(10,2)"
+
+    def test_same_column_multiple_changes_keep_original_order(self):
+        s = _fresh()
+        asset = self._seed_v1(s, "T10_ORDER")
+        s["change_capture"].capture_change(asset, "precision", "decimal(10,2)", "decimal(12,3)")
+        s["change_capture"].capture_change(asset, "precision", "decimal(12,3)", "decimal(16,4)")
+        s["version_history"].create_version(asset, "v2", "精度连续调整", "id,gross:decimal(16,4),name")
+        diffs = s["version_history"].compare_versions(asset, "v1", "v2")
+        assert [(d["源值"], d["目标值"]) for d in diffs] == [
+            ("decimal(10,2)", "decimal(12,3)"),
+            ("decimal(12,3)", "decimal(16,4)"),
+        ]
+
+    def test_reverse_comparison_flips_values_for_same_change(self):
+        s = _fresh()
+        asset = self._seed_v1(s, "T10_REVERSE")
+        s["change_capture"].capture_change(asset, "rename", "gross", "gross_amount")
+        s["version_history"].create_version(asset, "v2", "改名", "id,gross_amount:decimal(10,2),name")
+        forward = s["version_history"].compare_versions(asset, "v1", "v2")
+        backward = s["version_history"].compare_versions(asset, "v2", "v1")
+        assert len(forward) == len(backward) == 1
+        assert forward[0]["差异字段"] == "gross"
+        assert forward[0]["源值"] == "gross" and forward[0]["目标值"] == "gross_amount"
+        assert backward[0]["源值"] == "gross_amount" and backward[0]["目标值"] == "gross"
+        assert backward[0]["比较维度"] == forward[0]["比较维度"]
+
+    def test_middle_rename_not_hidden_by_same_head_and_tail(self):
+        s = _fresh()
+        asset = self._seed_v1(s, "T10_ROUNDTRIP")
+        s["change_capture"].capture_change(asset, "rename", "gross", "gross_amount")
+        s["change_capture"].capture_change(asset, "precision", "decimal(10,2)", "decimal(16,4)")
+        s["change_capture"].capture_change(asset, "rename", "gross_amount", "gross")
+        s["version_history"].create_version(asset, "v2", "收尾", "id,gross:decimal(16,4),name")
+
+        diffs = s["version_history"].compare_versions(asset, "v1", "v2")
+        pairs = [(d["源值"], d["目标值"]) for d in diffs]
+        assert ("gross", "gross_amount") in pairs
+        assert ("decimal(10,2)", "decimal(16,4)") in pairs
+        assert ("gross_amount", "gross") in pairs
+
+    def test_reverse_after_three_changes_keeps_detail_order(self):
+        s = _fresh()
+        asset = self._seed_v1(s, "T10_TRIPLE")
+        s["change_capture"].capture_change(asset, "precision", "decimal(10,2)", "decimal(12,3)")
+        s["change_capture"].capture_change(asset, "rename", "gross", "gross_amount")
+        s["change_capture"].capture_change(asset, "precision", "decimal(12,3)", "decimal(16,4)")
+        s["version_history"].create_version(asset, "v2", "结构调整", "id,gross_amount:decimal(16,4),name")
+
+        forward = s["version_history"].compare_versions(asset, "v1", "v2")
+        assert [(d["差异字段"], d["源值"], d["目标值"]) for d in forward] == [
+            ("gross", "decimal(10,2)", "decimal(12,3)"),
+            ("gross", "gross", "gross_amount"),
+            ("gross_amount", "decimal(12,3)", "decimal(16,4)"),
+        ]
+
+        backward = s["version_history"].compare_versions(asset, "v2", "v1")
+        assert [(d["差异字段"], d["源值"], d["目标值"]) for d in backward] == [
+            ("gross", "decimal(12,3)", "decimal(10,2)"),
+            ("gross", "gross_amount", "gross"),
+            ("gross_amount", "decimal(16,4)", "decimal(12,3)"),
+        ]
+
+    def test_version_schema_readable_from_both_entrypoints(self):
+        s = _fresh()
+        asset = self._seed_v1(s, "T10_SCHEMA")
+        s["version_history"].create_version(asset, "v2", "改名", "id,gross_amount:decimal(10,2),name")
+        expected = [
+            {"name": "id", "type": ""},
+            {"name": "gross_amount", "type": "decimal(10,2)"},
+            {"name": "name", "type": ""},
+        ]
+        assert s["version_history"].get_version_schema(asset, "v2") == expected
+        assert s["change_capture"].get_version_schema(asset, "v2") == expected
+
+    def test_unknown_version_yields_no_diff(self):
+        s = _fresh()
+        asset = self._seed_v1(s, "T10_MISSING")
+        # 未知版本不臆断为“整段结构被删除”，与原单次查询一致返回空明细。
+        assert s["version_history"].compare_versions(asset, "v1", "不存在") == []
+
+    def test_generic_entry_registration_feeds_ledger(self):
+        s = _fresh()
+        s["version_history"].create_entry({
+            "快照编号": "VERS-E1", "目标资产": "T10_ENTRY", "版本标签": "v1",
+            "Schema摘要": "id,gross:decimal(10,2)",
+        })
+        s["change_capture"].create_entry({
+            "记录编号": "CHAN-E1", "目标资产": "T10_ENTRY", "变更类型": "rename",
+            "变更前值": "gross", "变更后值": "gross_amount",
+        })
+        s["version_history"].create_entry({
+            "快照编号": "VERS-E2", "目标资产": "T10_ENTRY", "版本标签": "v2",
+            "Schema摘要": "id,gross_amount:decimal(10,2)",
+        })
+        diffs = s["version_history"].compare_versions("T10_ENTRY", "v1", "v2")
+        assert [(d["源值"], d["目标值"]) for d in diffs] == [("gross", "gross_amount")]
+
+    def test_capture_derives_missing_before_from_boundary(self):
+        s = _fresh()
+        asset = self._seed_v1(s, "T10_DERIVE")
+        result = s["change_capture"].capture_change(asset, "precision", None, "decimal(16,4)")
+        assert result["diff_report"]["diff_count"] == 1
+        stored = [d for d in store_mod.store.rows("diff_report")
+                  if d.get("change_id") == result["change"]["id"]]
+        assert (stored[0]["差异字段"], stored[0]["源值"], stored[0]["目标值"]) == (
+            "gross", "decimal(10,2)", "decimal(16,4)",
+        )
+
+    def test_store_snapshot_comparison_kept_working(self):
+        s = _fresh()
+        store_mod.store.create_snapshot("legacy-a", ["asset_registry"])
+        store_mod.store.rows("asset_registry")[0]["资产名称"] = "改过的名字"
+        store_mod.store.create_snapshot("legacy-b", ["asset_registry"])
+        diffs = s["change_capture"].compare_versions("asset_registry", "legacy-a", "legacy-b")
+        assert any(d["差异字段"] == "资产名称" for d in diffs)
+
+    def test_change_captured_before_version_stays_in_earlier_interval(self):
+        s = _fresh()
+        asset = self._seed_v1(s, "T10_BOUNDARY")
+        # 变更写在 v2 之前：归 v1->v2，不应出现在 v2->v3
+        s["change_capture"].capture_change(asset, "rename", "gross", "gross_amount")
+        s["version_history"].create_version(asset, "v2", "改名", "id,gross_amount:decimal(10,2),name")
+        s["change_capture"].capture_change(
+            asset, "precision", "decimal(10,2)", "decimal(18,4)", field="gross_amount")
+        s["version_history"].create_version(asset, "v3", "调精度", "id,gross_amount:decimal(18,4),name")
+
+        early = s["version_history"].compare_versions(asset, "v1", "v2")
+        late = s["version_history"].compare_versions(asset, "v2", "v3")
+        assert len(early) == 1 and early[0]["差异字段"] == "gross"
+        assert len(late) == 1 and late[0]["目标值"] == "decimal(18,4)"
